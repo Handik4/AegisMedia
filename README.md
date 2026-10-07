@@ -85,9 +85,9 @@ Official Staking ──► Media Ingestion ──► Deepfake Challenge ──�
 
 | Verdict | Condition | Economics |
 |---|---|---|
-| `CONFIRMED_DEEPFAKE` | (a) a signature that claims the entity but fails secp256k1 verification against its registered key, **or** (b) a valid signature over media whose **independently computed** pHash diverges more than 10 bits from the signed pHash, **or** (c) unsigned media, hosted off the entity's domain, whose independently computed pHash is within 10 bits of official media | Bond refunded. If a staked, domain-bound publisher exists: it is slashed, the challenger gets half of the slash and the victim is flagged for 7 days |
+| `CONFIRMED_DEEPFAKE` | (a) a signature that fails secp256k1 verification against the entity's registered key, **or** (b) a valid signature over media whose **independently computed** pHash diverges more than 10 bits from the signed pHash, **both only when the response carries an explicit `x-aegis-entity` header naming the entity**, **or** (c) unsigned media, hosted off the entity's domain, whose independently computed pHash is within 10 bits of official media | Bond refunded. If a staked, domain-bound publisher exists: it is slashed, the challenger gets half of the slash and the victim is flagged for 7 days |
 | `LEGITIMATE_MEDIA` | Exact authentic bytes; a valid signature over the exact bytes served; a valid signature whose independently hashed media matches within 10 bits; the entity's own domain; independently hashed media unrelated to the baselines; or text with no forgery evidence | Bond forfeited to the entity, fee kept |
-| `INCONCLUSIVE_DISMISSED` | URL unreachable, rate-limited, 4xx or 5xx; or **unmeasurable media** (a valid signature or media-like payload with no gateway, a JSON sidecar without a gateway) | Bond refunded, 3% fee kept |
+| `INCONCLUSIVE_DISMISSED` | URL unreachable, rate-limited, 4xx or 5xx; or **unmeasurable media** (a valid signature or media-like payload with no gateway, a JSON sidecar without a gateway), or **a signature with no explicit `x-aegis-entity` header claim** (`unclaimed_signature`) | Bond refunded, 3% fee kept |
 
 ### Economics and solvency
 
@@ -128,6 +128,10 @@ What is trusted, and what is not:
 | `phash` in a header or JSON sidecar | the value the signature covers | a **measurement of the media**. It is origin-asserted |
 | pHash returned by the configured gateway | the only independently computed perceptual hash | |
 
+### Explicit identity claim
+
+A signature found in a response is not, by itself, a claim that the host speaks for the entity. The contract only treats it as forgery evidence when the response carries an **`x-aegis-entity` HTTP response header naming the victim**. Response headers are set by the origin server, so only the host itself can make that claim; someone uploading a signed JSON file to a forum, bucket or IPFS gateway cannot set it. A signed file merely sitting on a domain is therefore `INCONCLUSIVE_DISMISSED` (`unclaimed_signature`), never a slash. A header naming a different entity is not a claim on the victim either.
+
 ### JSON sidecar and gateway limitation
 
 A JSON sidecar describes media, it is not the media. The GenVM runner cannot decode images or video, so a validator cannot hash a sidecar's referenced media itself. Therefore:
@@ -135,7 +139,7 @@ A JSON sidecar describes media, it is not the media. The GenVM runner cannot dec
 - **With a gateway** (`set_phash_gateway`): validators ask `GET {gateway}?url=<media_uri>` (the sidecar's `media_uri`, SSRF-checked) and compare the gateway's pHash to the signed one.
 - **Without a gateway, or without a safe `media_uri`**: a sidecar can only produce `INCONCLUSIVE_DISMISSED` (or `CONFIRMED_DEEPFAKE` when its signature is forged, since that needs no media measurement). It is never `LEGITIMATE_MEDIA`, because wrapping fake media in a sidecar with a genuine signature and an authentic-looking pHash would otherwise buy an unearned legitimacy verdict.
 
-This means that **no gateway is configured by default and perceptual-hash-based verdicts (b) and (c) are unavailable until the governor sets one.** Until then the contract enforces only exact-byte matches and signature checks.
+**No gateway is configured at deployment, and perceptual hashing is therefore disabled until the governor sets one with `set_phash_gateway`.** Without a gateway the contract falls back to exact-byte matches and signature checks only, and every case that would need a perceptual measurement (valid signature over re-encoded or sidecar-referenced media, unsigned look-alike media) resolves to `INCONCLUSIVE_DISMISSED`: bond refunded, 3% fee kept, nobody slashed. A missing gateway never produces a slash or a legitimacy verdict.
 
 ## Game Theory, Perceptual Hashing Limits & Threat Model
 
@@ -166,6 +170,7 @@ This means that **no gateway is configured by default and perceptual-hash-based 
 | Arbitrary publisher slashing | Name an innocent entity as `publisher` for any URL | The URL must be hosted on the publisher's registered domain (exact or subdomain), else revert |
 | News-article circuit-breaker DDoS | File real news articles that mention the entity; 0.015 GEN flags it for 7 days | A text mention is never evidence. Deepfake needs a forged signature or independently hashed media. The breaker trips only after a **real slash** of a staked, domain-bound publisher, so planting forgery evidence on a page you control (a junk signature) costs you your own stake |
 | JSON sidecar bypass | Wrap fake media in a sidecar with a valid signature and an authentic pHash | Origin-asserted pHashes are never trusted; no gateway means `INCONCLUSIVE_DISMISSED` |
+| Slashing a host for a stranger's signed file (UGC) | Upload a signed JSON to a forum or gateway on an entity's domain, then challenge that URL | Signature-based deepfake verdicts require an explicit `x-aegis-entity` response header, which uploaders cannot set; otherwise `INCONCLUSIVE_DISMISSED` |
 | Fee pool drain | `publisher = 0` paid a bounty out of accumulated fees | Bounties come only from slashed stake; the fee pool only ever grows |
 
 Residual cost to flag a victim: an attacker must register a staked entity (5 GEN minimum), host a forgery on its domain and lose half its stake, 25% of which is burned for good, to hold the breaker for 7 days. That is a deliberate price, not zero.
@@ -187,6 +192,9 @@ Residual cost to flag a victim: an attacker must register a staked entity (5 GEN
 
 ### Known limitations
 
+- **User-Generated Content (UGC):** Entities are strictly responsible for content hosted on their registered domains. If an entity allows arbitrary uploads (e.g., a forum or IPFS gateway) and a malicious signed JSON is hosted there, they are liable for slashing. The explicit-claim rule (`x-aegis-entity` header) protects a host from files it did not itself vouch for, but a host whose server serves that header on user-controlled content, or whose own pages are forged, is liable. Entities that accept uploads should register a separate domain for the registry channel and serve user content elsewhere.
+- **Stake is required to be slashed, and to trip the breaker.** An attacker or impersonator *without* a registered stake cannot be slashed and cannot trigger the circuit breaker. The protocol records the verdict and refunds the bond, nothing more. The breaker protects against registered entities going rogue or being impersonated by other registered publishers; it is not a general alarm for anonymous forgers.
+- **Perceptual hashing needs a gateway.** With no gateway set at deployment, only exact-byte and signature checks work and everything else is `INCONCLUSIVE_DISMISSED` (see above).
 - Pages that impersonate an entity in plain text (a fake announcement as HTML or a tweet) carry no cryptographic or perceptual evidence and are classified `LEGITIMATE_MEDIA`. The protocol authenticates media and signatures, not prose. This fails safe against griefing and unsafe for users reading forged text.
 - An unstaked impersonator (`publisher = 0`) can be recorded as a deepfake but cannot be slashed or trip the breaker. The breaker needs a staked, domain-bound publisher by design.
 - The slash is a fixed 50% of stake, with no per-incident severity scaling.

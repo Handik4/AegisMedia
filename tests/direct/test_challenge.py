@@ -75,7 +75,7 @@ def test_json_sidecar_descriptor_with_forged_signature_is_a_deepfake(scenario):
     import json
     forged = forged_headers(w)
     body = json.dumps({"aegis": {k[len("x-aegis-"):].replace("-", "_"): v for k, v in forged.items()}}).encode()
-    serve_forged(w, {}, body)
+    serve_forged(w, {"x-aegis-entity": str(w.victim)}, body)  # the host itself claims the entity
     r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
     assert r["verdict"] == "CONFIRMED_DEEPFAKE" and r["sig_state"] == "INVALID"
 
@@ -156,7 +156,7 @@ def test_incomplete_descriptor_cannot_prove_a_signature(scenario):
     body = json.dumps({"aegis": {"entity_id": str(w.victim), "signature": w.auth_headers["x-aegis-signature"],
                                  "content_uri": AUTH_URI, "sha256": AUTH_SHA, "metadata_digest": w.meta,
                                  "timestamp": str(w.ts)}}).encode()
-    serve_forged(w, {}, body)
+    serve_forged(w, {"x-aegis-entity": str(w.victim)}, body)
     r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
     assert (r["verdict"], r["sig_state"]) == ("CONFIRMED_DEEPFAKE", "INVALID")
 

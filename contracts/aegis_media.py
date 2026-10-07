@@ -13,10 +13,12 @@
 # features, and agree through a custom equivalence validator (run_nondet)
 # before any value moves:
 #
-#   CONFIRMED_DEEPFAKE    explicit evidence of forgery only: a signature claiming the
-#                         entity that fails secp256k1 verification; a valid signature
-#                         over media whose independently computed pHash diverges by
-#                         more than 10 bits; or unsigned media, off the entity's own
+#   CONFIRMED_DEEPFAKE    explicit evidence of forgery only: a signature that fails
+#                         secp256k1 verification, or a valid signature over media whose
+#                         independently computed pHash diverges by more than 10 bits,
+#                         in either case under an explicit `x-aegis-entity` response
+#                         header naming the entity (a signed file merely hosted on
+#                         someone's domain is INCONCLUSIVE); or unsigned media, off the entity's own
 #                         domain, whose independently computed pHash is within 10 bits
 #                         of official media. Merely mentioning an entity is never
 #                         evidence. The accused publisher must be hosted on the
@@ -538,6 +540,7 @@ def _observe(
         "official": _host_matches(uri, domain),
         "sig": SIG_MISSING,
         "claims_victim": False,
+        "explicit_claim": False,
         "exact": False,
         "bound": False,
         "sidecar": False,
@@ -570,6 +573,12 @@ def _observe(
     # --- signature (cryptographic evidence) ------------------------------
     d_entity = _as_int(desc.get("entity_id"), -1)
     f["claims_victim"] = d_entity < 0 or d_entity == victim_id
+    # An explicit identity claim is the `x-aegis-entity` RESPONSE HEADER naming the
+    # victim. Headers are set by the origin server, so only the host itself can make
+    # one; someone uploading a signed JSON to a forum, bucket or IPFS gateway cannot.
+    # Signature-based deepfake verdicts require it, so hosting a stranger's file is
+    # never, by itself, grounds for slashing the host.
+    f["explicit_claim"] = _as_int(_header(headers, "x-aegis-entity"), -1) == victim_id
     d_sha = _norm_hex(desc.get("sha256", ""), 64)
     d_phash = _norm_hex(desc.get("phash", ""), 16)
     sig_hex = desc.get("signature", "")
@@ -623,8 +632,10 @@ def _decide(f: dict) -> tuple:
     """Deterministic (verdict, reason) from observed features.
 
     CONFIRMED_DEEPFAKE needs explicit evidence of forgery:
-      * a signature claiming the entity that fails secp256k1 verification, or
-      * a valid signature whose media, hashed independently, diverges > 10 bits, or
+      * a signature, under an explicit x-aegis-entity header naming the entity, that
+        fails secp256k1 verification, or
+      * a valid signature, under that header, whose media, hashed independently,
+        diverges > 10 bits, or
       * independently hashed media within 10 bits of official media, unsigned,
         hosted off the entity's domain.
     A page that merely mentions an entity is never a deepfake."""
@@ -632,15 +643,19 @@ def _decide(f: dict) -> tuple:
         return V_INCONCLUSIVE, "unreachable"
     if f["exact"]:
         return V_LEGIT, "exact_authentic_bytes"
-    if f["sig"] == SIG_INVALID and f["claims_victim"]:
-        return V_DEEPFAKE, "forged_signature"
+    if f["sig"] == SIG_INVALID:
+        if f["explicit_claim"]:
+            return V_DEEPFAKE, "forged_signature"
+        return V_INCONCLUSIVE, "unclaimed_signature"
     if f["sig"] == SIG_VALID:
         if f["bound"]:
             return V_LEGIT, "signed_bytes_match"
         if f["d_signed"] >= 0:
             if f["d_signed"] <= HAMMING_THRESHOLD:
                 return V_LEGIT, "valid_signature_and_phash_match"
-            return V_DEEPFAKE, "phash_divergence"
+            if f["explicit_claim"]:
+                return V_DEEPFAKE, "phash_divergence"
+            return V_INCONCLUSIVE, "unclaimed_signature"
         return V_INCONCLUSIVE, "unverifiable_signed_media"
     if f["official"]:
         return V_LEGIT, "official_channel_origin"

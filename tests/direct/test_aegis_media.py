@@ -152,7 +152,8 @@ def test_sidecar_without_a_media_reference_is_inconclusive_even_with_a_gateway(s
 def test_sidecar_with_gateway_hashes_the_referenced_media_and_catches_the_fake(scenario):
     w = scenario
     gateway(w, phash_at_distance(PHASH_BASE, 25))  # the referenced media is not the signed one
-    mock_page(w, r"impostor\.example", body=sidecar_body(w, w.auth_headers, "https://impostor.example/fake.mp4"), headers={})
+    mock_page(w, r"impostor\.example", body=sidecar_body(w, w.auth_headers, "https://impostor.example/fake.mp4"),
+              headers={"x-aegis-entity": str(w.victim)})  # the host itself claims the entity
     r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
     assert (r["verdict"], r["reason"]) == ("CONFIRMED_DEEPFAKE", "phash_divergence")
     assert r["distance"] == 25 and r["slashed"] == 10 * ATTO
@@ -223,3 +224,53 @@ def test_fee_pool_never_decreases_across_every_verdict_path(scenario):
     pools.append(w.c.get_solvency()["protocol_fees"])
     assert pools == sorted(pools) and pools[-1] > pools[0]
     solvent(w)
+
+
+# ------------------------------------------------- reviewer: UGC / unclaimed signatures
+def test_poc_signed_json_on_a_ugc_host_does_not_slash_the_host(scenario):
+    """Someone uploads a signed JSON to a forum or IPFS gateway on an entity's domain.
+    The host never claimed the identity (no x-aegis-entity header), so it is not slashed."""
+    w = scenario
+    forged = forged_headers(w)
+    body = sidecar_body(w, forged, media_uri="https://impostor.example/fake.mp4")
+    mock_page(w, r"impostor\.example", body=body, headers={"content-type": "application/json"})
+    r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
+    assert (r["verdict"], r["reason"]) == ("INCONCLUSIVE_DISMISSED", "unclaimed_signature")
+    assert r["slashed"] == 0 and w.c.get_entity(w.publisher)["stake"] == 20 * ATTO
+    assert not w.c.is_impersonation_active(w.victim)
+
+
+def test_valid_signature_with_diverging_media_but_no_header_claim_is_inconclusive(scenario):
+    w = scenario
+    gateway(w, phash_at_distance(PHASH_BASE, 30))
+    no_claim = {k: v for k, v in w.auth_headers.items() if k != "x-aegis-entity"}
+    mock_page(w, r"impostor\.example", body=b"other media", headers=no_claim)
+    r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
+    assert (r["verdict"], r["reason"]) == ("INCONCLUSIVE_DISMISSED", "unclaimed_signature")
+    assert r["slashed"] == 0
+
+
+def test_forged_signature_without_a_header_claim_is_inconclusive(scenario):
+    w = scenario
+    no_claim = {k: v for k, v in forged_headers(w).items() if k != "x-aegis-entity"}
+    mock_page(w, r"impostor\.example", body=b"x", headers=no_claim)
+    r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
+    assert (r["verdict"], r["reason"]) == ("INCONCLUSIVE_DISMISSED", "unclaimed_signature")
+    assert r["sig_state"] == "INVALID" and r["slashed"] == 0
+
+
+def test_header_naming_a_different_entity_is_not_a_claim_on_the_victim(scenario):
+    w = scenario
+    other = dict(forged_headers(w), **{"x-aegis-entity": str(w.publisher)})
+    mock_page(w, r"impostor\.example", body=b"x", headers=other)
+    r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
+    assert r["verdict"] == "INCONCLUSIVE_DISMISSED" and r["slashed"] == 0
+
+
+def test_explicit_header_claim_with_forged_signature_still_slashes(scenario):
+    """The legitimate case keeps working: the host's own server asserts the identity."""
+    w = scenario
+    mock_page(w, r"impostor\.example", body=b"x", headers=forged_headers(w))
+    r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
+    assert (r["verdict"], r["reason"]) == ("CONFIRMED_DEEPFAKE", "forged_signature")
+    assert r["slashed"] == 10 * ATTO
