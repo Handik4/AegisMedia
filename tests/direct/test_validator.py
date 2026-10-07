@@ -3,8 +3,10 @@ from conftest import *
 
 
 def serve(w, body=b"Ethereum Foundation announces a giveaway", headers=None, status=200):
+    """Default page carries a forged descriptor (a deepfake); headers={} serves a plain page."""
     w.vm.clear_mocks()
-    mock_page(w, r"impostor\.example", status=status, body=body, headers=headers or {})
+    mock_page(w, r"impostor\.example", status=status, body=body,
+              headers=forged_headers(w) if headers is None else headers)
 
 
 def set_gateway(w, phash):
@@ -31,7 +33,7 @@ def test_validator_disagrees_when_it_sees_a_legitimate_page(scenario):
     w = scenario
     serve(w)
     challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
-    serve(w, body=b"a video about cats")
+    serve(w, body=b"a video about cats", headers={})
     assert w.vm.run_validator() is False
 
 
@@ -83,7 +85,7 @@ def test_validator_rejects_a_forged_leader_verdict(scenario):
     w = scenario
     serve(w)  # honest evidence: unsigned page claiming identity -> deepfake
     challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
-    lie = {"reachable": True, "status": 200, "verdict": "LEGITIMATE_MEDIA", "sig": "MISSING", "exact": False,
+    lie = {"reachable": True, "status": 200, "verdict": "LEGITIMATE_MEDIA", "sig": "INVALID", "exact": False, "trusted": False,
            "d_base": -1, "d_signed": -1}
     assert w.vm.run_validator(leader_result=lie) is False
 

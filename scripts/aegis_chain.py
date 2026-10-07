@@ -19,7 +19,8 @@ from genlayer_py.chains import studio_devnet  # type: ignore[reportAttributeAcce
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT / ".env"
-DEPLOYMENT_JSON = ROOT / "frontend" / "lib" / "deployment.json"
+DEPLOYMENT_JSON = ROOT / "frontend" / "lib" / "deployment.json"  # read by the dashboard
+DEPLOYMENTS_FILE = ROOT / "deployments" / "studio-next.json"  # canonical record
 CONTRACT_FILE = ROOT / "contracts" / "aegis_media.py"
 ATTO = 10**18
 CHAIN_ID = 61997
@@ -174,20 +175,21 @@ class Chain:
 
 
 def load_deployment() -> dict:
-    return json.loads(DEPLOYMENT_JSON.read_text())
+    return json.loads(DEPLOYMENTS_FILE.read_text())
 
 
 def save_deployment(address: str, tx: str | None) -> None:
-    DEPLOYMENT_JSON.write_text(
-        json.dumps(
-            {
-                "address": address,
-                "network": "studio-next",
-                "chainId": CHAIN_ID,
-                "deployedAt": int(time.time()),
-                "deployTx": tx,
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    """Write the canonical deployment record and sync the address to the frontend."""
+    record = json.dumps(
+        {
+            "address": address,
+            "network": "studio-next",
+            "chainId": CHAIN_ID,
+            "deployedAt": int(time.time()),
+            "deployTx": tx,
+        },
+        indent=2,
+    ) + "\n"
+    DEPLOYMENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DEPLOYMENTS_FILE.write_text(record)
+    DEPLOYMENT_JSON.write_text(record)

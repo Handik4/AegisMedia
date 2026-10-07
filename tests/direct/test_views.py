@@ -36,7 +36,7 @@ def test_verify_media_picks_the_closest_baseline(scenario):
 
 def test_verify_media_reports_flagged_entity(scenario):
     w = scenario
-    mock_page(w, r"impostor\.example", body=b"Ethereum Foundation giveaway")
+    mock_page(w, r"impostor\.example", body=b"Ethereum Foundation giveaway", headers=forged_headers(w))
     challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
     assert w.c.verify_media(AUTH_SHA, PHASH_BASE)["flagged"] is True
 

@@ -26,7 +26,7 @@ function stepFor(phase: string, snap: TxSnapshot | null): number {
 }
 
 const VERDICT_STYLE: Record<Verdict, { label: string; tone: string; icon: typeof ShieldAlert; blurb: string }> = {
-  CONFIRMED_DEEPFAKE: { label: "CONFIRMED DEEPFAKE", tone: "var(--alarm)", icon: ShieldAlert, blurb: "Impersonation confirmed. The publisher is slashed and the circuit breaker is engaged." },
+  CONFIRMED_DEEPFAKE: { label: "CONFIRMED DEEPFAKE", tone: "var(--alarm)", icon: ShieldAlert, blurb: "Forgery evidence confirmed. A staked, domain-bound publisher is slashed and the circuit breaker is engaged; with no publisher the verdict is recorded but nothing is slashed." },
   LEGITIMATE_MEDIA: { label: "LEGITIMATE MEDIA", tone: "var(--seal)", icon: ShieldCheck, blurb: "The evidence holds up. The challenge bond is forfeited to the entity." },
   INCONCLUSIVE_DISMISSED: { label: "INCONCLUSIVE · DISMISSED", tone: "var(--amber)", icon: ShieldQuestion, blurb: "The URL could not be assessed. The bond is refunded; the arbitration fee is kept." },
 };
@@ -182,7 +182,7 @@ export default function ChallengeTerminal() {
       <p className="label">03 · Challenge terminal</p>
       <h2 className="mt-2 font-display text-3xl sm:text-4xl">Report an impostor</h2>
       <p className="mt-2 max-w-2xl text-sm text-[color:var(--muted)]">
-        Post a refundable bond plus a 3% arbitration fee. Validators fetch the link independently, compare perceptual hashes, verify the signature and agree on a verdict. A forged broadcast pays you a bounty; a false alarm forfeits your bond.
+        Post a refundable bond plus a 3% arbitration fee. Validators fetch the link independently and look for explicit forgery evidence: a forged signature, or media whose independently computed perceptual hash diverges. Mentioning an entity is not evidence. A slashed publisher pays you a bounty; a false alarm forfeits your bond. A named publisher must host the URL on its registered domain.
       </p>
 
       <div className="mt-6 grid gap-5 lg:grid-cols-[1fr_1.1fr]">
@@ -199,8 +199,8 @@ export default function ChallengeTerminal() {
             </label>
             <label className="block"><span className="label">Publishing entity (staked channel that posted it)</span>
               <select className="field mt-1" value={publisher} onChange={(e) => setPublisher(Number(e.target.value))} disabled={!configured}>
-                <option value={0}>Unknown / unstaked (bounty paid from the fee pool)</option>
-                {entities.map((e) => <option key={e.id} value={e.id}>{e.name} · stake {fmtGen(e.stake, 2)} GEN</option>)}
+                <option value={0}>Unknown publisher (no slash, no bounty, no alert)</option>
+                {entities.map((e) => <option key={e.id} value={e.id}>{e.name} · {e.domain} · stake {fmtGen(e.stake, 2)} GEN</option>)}
               </select>
             </label>
             <label className="block"><span className="label">Challenge bond (GEN)</span>

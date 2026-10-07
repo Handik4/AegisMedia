@@ -180,3 +180,9 @@ def solvent(w) -> dict:
     assert s["total_in"] == s["total_paid_out"] + s["entity_stakes"] + s["challenger_bonds"] \
         + s["claimable"] + s["protocol_fees"]
     return s
+
+
+def forged_headers(w, victim_id=None):
+    """An x-aegis descriptor claiming the victim entity, signed by the attacker's key."""
+    return descriptor_headers(w, KEY_ATTACKER, victim_id or w.victim, AUTH_URI, AUTH_SHA, PHASH_BASE,
+                              w.meta, w.ts)

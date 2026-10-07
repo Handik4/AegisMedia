@@ -1,21 +1,23 @@
-#!/usr/bin/env python3
 """End-to-end verification against the deployed contract on Studio Next.
+
+    .venv/bin/python -m scripts.verify_live
 
 Checks, in order:
   1. the seed entities are registered with their stakes,
   2. an authentic media announcement is anchored with a valid EIP-712 signature,
-  3. a deepfake challenge is adjudicated by validator consensus, slashes the
-     publisher, pays the challenger a bounty and trips the circuit breaker,
-  4. the solvency invariant holds.
+  3. hardening: a news-style page mentioning the entity is NOT a deepfake and does not
+     flag it; naming an unrelated entity as publisher reverts,
+  4. a forged-signature challenge on a staked publisher's own domain is adjudicated by
+     validator consensus, slashes the publisher, pays the bounty and trips the breaker,
+  5. the solvency invariant holds and the fee pool was never paid out.
 
-    .venv/bin/python scripts/verify_live.py
-
-The contested URL must be reachable by the validators; the default is an httpbin echo
-page that mentions the entity and carries no signature. Override with AEGIS_CONTESTED_URL.
+The contested URLs must be reachable by the validators. httpbin.org echoes query
+parameters back as response headers, so a forged x-aegis-signature can be served
+without hosting anything. The "rogue" publisher registers httpbin.org as its domain
+(registration does not prove domain control; see the README threat model).
 """
 
 import hashlib
-import os
 import sys
 import time
 import urllib.parse
@@ -24,7 +26,10 @@ from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak
 
-from aegis_chain import ATTO, Chain, get_or_create_key, load_deployment
+try:
+    from .aegis_chain import ATTO, Chain, ChainError, get_or_create_key, load_deployment
+except ImportError:
+    from aegis_chain import ATTO, Chain, ChainError, get_or_create_key, load_deployment
 
 PASS, FAIL = "PASS", "FAIL"
 results: list[tuple[str, bool, str]] = []
@@ -52,6 +57,11 @@ def sign_announcement(domain: dict, key: str, entity_id: int, uri: str, sha: str
     }
     signed = Account.sign_message(encode_typed_data(full_message=full), key)
     return "0x" + signed.signature.hex().removeprefix("0x")
+
+
+def bond_value(bond: int) -> int:
+    """msg.value for a bond: the bond plus the 3% non-refundable arbitration fee."""
+    return bond + bond * 300 // 10000
 
 
 def main() -> int:
@@ -96,38 +106,60 @@ def main() -> int:
     unknown = owner.read("verify_media", [hashlib.sha256(b"never anchored").hexdigest(), f"{int(phash, 16) ^ (2**20 - 1):016x}"])
     check("unrelated media is UNVERIFIED", unknown["status"] == "UNVERIFIED")
 
-    # 3. deepfake challenge -------------------------------------------------
-    rogue.client  # noqa: B018
-    rogue.write("register_entity",
-                [f"Rogue Newswire {ts}", f"rogue-{ts}.example", f"@rogue{ts}", rogue.address.lower()],
-                value=5 * ATTO)
-    rogue_id = int(owner.read("find_entity_by_domain", [f"rogue-{ts}.example"]))
+    # 3. hardening: news article and publisher binding --------------------
+    news_url = "https://httpbin.org/anything?" + urllib.parse.urlencode(
+        {"msg": f"Ethereum Foundation (ethereum.org, @ethereum) announces its roadmap {ts}"})
+    hunter.write("challenge_broadcast", [ef_id, news_url, 0], value=bond_value(ATTO // 2))
+    news = owner.read("get_challenge", [int(owner.read("get_challenge_count"))])
+    check("news article mentioning the entity is not a deepfake",
+          news["verdict"] != "CONFIRMED_DEEPFAKE", f"{news['verdict']} ({news['reason']})")
+    check("news article did not trip the circuit breaker", not bool(owner.read("is_impersonation_active", [ef_id])))
+
+    rogue_id = int(owner.read("find_entity_by_domain", ["httpbin.org"]))
+    if rogue_id == 0:
+        rogue.write("register_entity", [f"Rogue Newswire {ts}", "httpbin.org", f"@rogue{ts}", rogue.address.lower()],
+                    value=5 * ATTO)
+        rogue_id = int(owner.read("find_entity_by_domain", ["httpbin.org"]))
     stake_before = int(owner.read("get_entity", [rogue_id])["stake"])
 
-    contested = os.environ.get("AEGIS_CONTESTED_URL") or (
-        "https://httpbin.org/anything?" + urllib.parse.urlencode(
-            {"msg": f"Ethereum Foundation (ethereum.org) announces a surprise airdrop {ts}"}))
-    bond = ATTO // 2
-    print(f"challenging {contested}")
-    hunter.write("challenge_broadcast", [ef_id, contested, rogue_id], value=bond + bond * 300 // 10000)
-    count = int(owner.read("get_challenge_count"))
-    ch = owner.read("get_challenge", [count])
-    check("validators confirm the deepfake", ch["verdict"] == "CONFIRMED_DEEPFAKE", f"{ch['verdict']} ({ch['reason']})")
+    try:
+        hunter.write("challenge_broadcast", [ef_id, "https://example.com/unrelated.png", rogue_id],
+                     value=bond_value(ATTO // 2))
+        mismatch_blocked = False
+    except ChainError:
+        mismatch_blocked = True
+    check("naming a publisher whose domain does not host the URL reverts", mismatch_blocked)
+    check("the innocent publisher's stake is untouched",
+          int(owner.read("get_entity", [rogue_id])["stake"]) == stake_before)
+
+    # 4. forged-signature deepfake on the publisher's own domain -------------
+    forged = sign_announcement(domain, get_or_create_key("AEGIS_ROGUE_KEY"), ef_id, uri, sha, phash, md, ts)
+    contested = "https://httpbin.org/response-headers?" + urllib.parse.urlencode(
+        {"x-aegis-entity": ef_id, "x-aegis-signature": forged, "nonce": ts})
+    pool_before = int(owner.read("get_solvency")["protocol_fees"])
+    print(f"challenging {contested[:90]}…")
+    hunter.write("challenge_broadcast", [ef_id, contested, rogue_id], value=bond_value(ATTO // 2))
+    ch = owner.read("get_challenge", [int(owner.read("get_challenge_count"))])
+    check("validators confirm the forged-signature deepfake",
+          ch["verdict"] == "CONFIRMED_DEEPFAKE", f"{ch['verdict']} ({ch['reason']})")
     stake_after = int(owner.read("get_entity", [rogue_id])["stake"])
-    check("publisher stake slashed by 50%", stake_before - stake_after == stake_before // 2, f"{stake_before / ATTO} -> {stake_after / ATTO} GEN")
+    check("publisher stake slashed by 50%", stake_before - stake_after == stake_before // 2,
+          f"{stake_before / ATTO} -> {stake_after / ATTO} GEN")
     check("50% of the slash burned, 50% paid as bounty",
           int(ch["burned"]) + int(ch["bounty"]) == int(ch["slashed"]) and int(ch["bounty"]) > 0)
     check("circuit breaker engaged for the impersonated entity", bool(owner.read("is_impersonation_active", [ef_id])))
     claimable = int(owner.read("get_claimable", [hunter.address]))
-    check("challenger can claim bond + bounty", claimable == int(ch["bond"]) + int(ch["bounty"]), f"{claimable / ATTO} GEN")
+    check("challenger can claim refunded bonds + bounty", claimable >= int(ch["bond"]) + int(ch["bounty"]),
+          f"{claimable / ATTO} GEN")
     hunter.write("claim_payout")
     check("claim pays out", int(owner.read("get_claimable", [hunter.address])) == 0)
 
-    # 4. solvency -----------------------------------------------------------
+    # 5. solvency and fee pool -------------------------------------------------
     s = owner.read("get_solvency")
     locked = int(s["entity_stakes"]) + int(s["challenger_bonds"]) + int(s["claimable"]) + int(s["protocol_fees"])
     check("solvency: total_in == total_paid_out + liabilities",
           bool(s["solvent"]) and int(s["total_in"]) == int(s["total_paid_out"]) + locked)
+    check("fee pool was never paid out as a bounty", int(s["protocol_fees"]) >= pool_before)
 
     failed = [r for r in results if not r[1]]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")

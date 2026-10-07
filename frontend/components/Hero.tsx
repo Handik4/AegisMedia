@@ -45,7 +45,7 @@ export default function Hero() {
             If it isn&rsquo;t <em className="text-indigo-600 not-italic">sealed</em> on-chain,<br className="hidden sm:block" /> it isn&rsquo;t official.
           </h1>
           <p className="mt-5 max-w-xl text-base text-[color:var(--muted)]">
-            Founders, foundations and DAOs stake GEN to anchor announcements with a perceptual hash and an EIP-712 signature. Anyone can challenge a forgery; GenVM validators compare the evidence independently, slash the forger and trip a circuit breaker that tokens and DeFi protocols can read.
+            Founders, foundations and DAOs stake GEN to anchor announcements with a perceptual hash and an EIP-712 signature. Anyone can challenge a forgery; GenVM validators compare the evidence independently, slash the publisher and trip a circuit breaker that tokens and DeFi protocols can read.
           </p>
         </div>
         <div className="grid grid-cols-2 gap-3">

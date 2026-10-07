@@ -13,16 +13,28 @@
 # features, and agree through a custom equivalence validator (run_nondet)
 # before any value moves:
 #
-#   CONFIRMED_DEEPFAKE    perceptual divergence > 10 bits, or a forged / missing
-#                         signature on media that claims the entity's identity.
-#                         The publisher's stake is slashed (50% burned, 50%
-#                         bounty to the challenger) and the victim entity is
+#   CONFIRMED_DEEPFAKE    explicit evidence of forgery only: a signature claiming the
+#                         entity that fails secp256k1 verification; a valid signature
+#                         over media whose independently computed pHash diverges by
+#                         more than 10 bits; or unsigned media, off the entity's own
+#                         domain, whose independently computed pHash is within 10 bits
+#                         of official media. Merely mentioning an entity is never
+#                         evidence. The accused publisher must be hosted on the
+#                         contested URL's domain; its stake is slashed (50% burned,
+#                         50% bounty to the challenger) and only then is the victim
 #                         flagged FLAGGED_IMPERSONATION for 7 days.
-#   LEGITIMATE_MEDIA      valid signature + matching hash, or no impersonation
-#                         claim at all. The challenger's bond is forfeited to
-#                         the entity.
-#   INCONCLUSIVE_DISMISSED  the URL was unreachable / rate-limited. Bond is
-#                         refunded; the arbitration fee is still kept.
+#   LEGITIMATE_MEDIA      exact authentic bytes, a valid signature over the served
+#                         bytes or over media that matches its signed pHash, the
+#                         entity's own domain, or no forgery evidence at all. The
+#                         challenger's bond is forfeited to the entity.
+#   INCONCLUSIVE_DISMISSED  URL unreachable / rate-limited, or media that cannot be
+#                         measured (no pHash gateway, JSON sidecar without one).
+#                         Bond is refunded; the arbitration fee is still kept.
+#
+# A perceptual hash is only evidence when a validator derived it independently (a
+# configured gateway hashing the raw media). A pHash asserted by the origin, in a
+# header or a JSON sidecar, is never trusted. Bounties are paid only from a
+# publisher's slashed stake, never from the fee pool.
 #
 # External DeFi / token contracts query `is_impersonation_active(entity_id)`.
 #
@@ -58,6 +70,7 @@ ERR_REPLAY = "ERR_REPLAY"
 ERR_EXPIRED = "ERR_CHALLENGE_EXPIRED"
 ERR_COOLDOWN = "ERR_COOLDOWN"
 ERR_UNSAFE_URL = "ERR_UNSAFE_URL"
+ERR_PUBLISHER = "ERR_PUBLISHER_MISMATCH"
 ERR_NO_BALANCE = "ERR_NO_CLAIMABLE_BALANCE"
 ERR_TRANSFER = "ERR_TRANSFER_FAILED_RESTORED"
 
@@ -78,7 +91,6 @@ MIN_CHALLENGE_BOND = ATTO // 2  # 0.5 GEN
 ARBITRATION_FEE_BPS = 300  # 3% of the bond, non-refundable
 SLASH_BPS = 5000  # share of the publisher's stake slashed on a confirmed deepfake
 BURN_BPS = 5000  # share of the slashed amount that is burned
-UNSTAKED_BOUNTY_CAP_BPS = 5000  # share of the fee pool payable when the publisher has no stake
 BPS = 10000
 BURN_ADDRESS = "0x000000000000000000000000000000000000dEaD"
 
@@ -102,7 +114,6 @@ MAX_NAME = 64
 MAX_DOMAIN = 128
 MAX_HANDLE = 64
 MAX_URI = 512
-MAX_TEXT_SCAN = 200_000
 
 # --- EIP-712 -----------------------------------------------------------------
 CHAIN_ID = 61997
@@ -424,15 +435,10 @@ _DESCRIPTOR_HEADERS = {
     "x-aegis-timestamp": "timestamp",
     "x-aegis-signature": "signature",
     "x-aegis-channel": "channel",
+    "x-aegis-media-uri": "media_uri",
 }
-
-
-def _to_text(body) -> str:
-    if body is None:
-        return ""
-    if isinstance(body, (bytes, bytearray)):
-        return bytes(body)[:MAX_TEXT_SCAN].decode("utf-8", errors="ignore")
-    return str(body)[:MAX_TEXT_SCAN]
+_DESCRIPTOR_KEYS = tuple(_DESCRIPTOR_HEADERS.values())
+_MEDIA_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF", b"OggS", b"ID3", b"\x1aE\xdf\xa3")
 
 
 def _to_bytes(body) -> bytes:
@@ -443,29 +449,46 @@ def _to_bytes(body) -> bytes:
     return str(body).encode("utf-8")
 
 
+def _header(headers, name: str) -> str:
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            if str(k).lower() == name:
+                return v.decode("utf-8", errors="ignore") if isinstance(v, (bytes, bytearray)) else str(v)
+    return ""
+
+
+def _looks_like_media(headers, body: bytes) -> bool:
+    ctype = _header(headers, "content-type").lower()
+    if ctype.startswith(("image/", "video/", "audio/")) or ctype == "application/octet-stream":
+        return True
+    return body.startswith(_MEDIA_MAGIC) or body[4:8] == b"ftyp"
+
+
 def _descriptor_from(headers, body_bytes: bytes) -> dict:
-    """Aegis descriptor fields, taken from x-aegis-* response headers and, when
-    the body is a JSON object, from its top level or its `aegis` member."""
+    """Aegis descriptor fields, taken from x-aegis-* response headers and, when the
+    body is a JSON object, from its top level or its `aegis` member. `_sidecar` is
+    True only when the JSON body itself carries descriptor fields (a sidecar that
+    stands in for the media); an unrelated JSON document is not a sidecar."""
     desc = {}
     if isinstance(headers, dict):
         for k, v in headers.items():
             key = _DESCRIPTOR_HEADERS.get(str(k).lower())
             if key is not None:
                 desc[key] = v.decode("utf-8", errors="ignore") if isinstance(v, (bytes, bytearray)) else str(v)
-    stripped = body_bytes.lstrip()[:1]
-    is_json = False
-    if stripped == b"{":
+    sidecar = False
+    if body_bytes.lstrip()[:1] == b"{":
         try:
             doc = json.loads(body_bytes.decode("utf-8"))
             if isinstance(doc, dict):
                 src = doc["aegis"] if isinstance(doc.get("aegis"), dict) else doc
-                for key in _DESCRIPTOR_HEADERS.values():
-                    if key in src and key not in desc:
-                        desc[key] = str(src[key])
-                is_json = True
+                for key in _DESCRIPTOR_KEYS:
+                    if key in src:
+                        sidecar = True
+                        if key not in desc:
+                            desc[key] = str(src[key])
         except Exception:
             pass
-    desc["_json_body"] = is_json
+    desc["_sidecar"] = sidecar
     return desc
 
 
@@ -476,13 +499,15 @@ def _as_int(v, default: int = -1) -> int:
         return default
 
 
-def _fetch_gateway_phash(gateway: str, uri: str) -> str:
-    """Optional trusted pHash gateway: GET {gateway}?url=<uri> -> {"phash": hex16}."""
-    if gateway == "":
+def _fetch_gateway_phash(gateway: str, media_uri: str) -> str:
+    """Trusted pHash gateway: GET {gateway}?url=<media> -> {"phash": hex16}. The
+    gateway fetches the raw media and hashes it, which the VM cannot do itself, so
+    it is the ONLY source of an independently computed perceptual hash."""
+    if gateway == "" or media_uri == "":
         return ""
     try:
         sep = "&" if "?" in gateway else "?"
-        res = gl.nondet.web.get(f"{gateway}{sep}url={quote(uri, safe='')}")
+        res = gl.nondet.web.get(f"{gateway}{sep}url={quote(media_uri, safe='')}")
         if not (isinstance(res.status, int) and 200 <= res.status < 300):
             return ""
         doc = json.loads(_to_bytes(res.body).decode("utf-8"))
@@ -494,24 +519,30 @@ def _fetch_gateway_phash(gateway: str, uri: str) -> str:
 def _observe(
     uri: str,
     victim_id: int,
-    name: str,
     domain: str,
-    handle: str,
     signer: str,
     baselines: list,
     domain_separator: bytes,
     gateway: str,
 ) -> dict:
     """Fetch the contested URL and reduce it to a small, comparable feature set.
-    Never raises and never touches storage."""
+    Never raises and never touches storage.
+
+    Trust model: a perceptual hash only counts as evidence when a validator derived
+    it independently (the gateway hashing the raw media). A pHash asserted by the
+    origin, in a header or a JSON sidecar, is used solely to verify the signature
+    that covers it, never as a measurement of the media."""
     f = {
         "reachable": False,
         "status": 0,
-        "claims": False,
         "official": _host_matches(uri, domain),
         "sig": SIG_MISSING,
+        "claims_victim": False,
         "exact": False,
-        "mismatch": False,
+        "bound": False,
+        "sidecar": False,
+        "media_like": False,
+        "trusted": False,
         "d_base": -1,
         "d_signed": -1,
         "best": "",
@@ -528,28 +559,20 @@ def _observe(
         return f
     f["reachable"] = True
 
+    headers = getattr(res, "headers", {})
     body = _to_bytes(res.body)
     body_sha = hashlib.sha256(body).hexdigest()
     f["body_sha"] = body_sha
-    desc = _descriptor_from(getattr(res, "headers", {}), body)
+    desc = _descriptor_from(headers, body)
+    f["sidecar"] = desc["_sidecar"]
+    f["media_like"] = _looks_like_media(headers, body)
 
-    text = _to_text(res.body).lower()
-    mention = (
-        (name != "" and name.lower() in text)
-        or (domain != "" and domain in text)
-        or (handle != "" and handle.lower() in text)
-    )
+    # --- signature (cryptographic evidence) ------------------------------
     d_entity = _as_int(desc.get("entity_id"), -1)
-    declared = d_entity == victim_id or str(desc.get("channel", "")).lower() in (
-        handle.lower(),
-        domain,
-    )
-    sig_hex = desc.get("signature", "")
-    f["claims"] = bool(mention or declared or sig_hex != "")
-
-    # --- signature -------------------------------------------------------
+    f["claims_victim"] = d_entity < 0 or d_entity == victim_id
     d_sha = _norm_hex(desc.get("sha256", ""), 64)
     d_phash = _norm_hex(desc.get("phash", ""), 16)
+    sig_hex = desc.get("signature", "")
     signed_ok = False
     if sig_hex != "":
         recovered = recover_announcement_signer(
@@ -562,28 +585,26 @@ def _observe(
             _as_int(desc.get("timestamp"), -1),
             sig_hex,
         )
-        signed_ok = recovered != "" and recovered == signer and (d_entity < 0 or d_entity == victim_id)
+        signed_ok = recovered != "" and recovered == signer and f["claims_victim"]
         f["sig"] = SIG_VALID if signed_ok else SIG_INVALID
-
-    # --- observed perceptual hash ---------------------------------------
-    observed = _fetch_gateway_phash(gateway, uri)
-    if observed == "" and d_phash != "":
-        if desc["_json_body"]:
-            observed = d_phash  # sidecar descriptor: origin-asserted
-        elif d_sha == body_sha:
-            observed = d_phash  # served bytes are exactly the signed bytes
-        else:
-            f["mismatch"] = True  # served bytes differ from the signed payload
-    f["phash"] = observed
+    # A valid signature over the exact bytes served is bound evidence on its own.
+    f["bound"] = signed_ok and not f["sidecar"] and d_sha != "" and d_sha == body_sha
 
     sha_set = {b["sha"]: b["id"] for b in baselines}
     if body_sha in sha_set:
         f["exact"] = True
         f["best"] = sha_set[body_sha]
-    elif d_sha != "" and d_sha == body_sha and d_sha in sha_set:
-        f["exact"] = True
-        f["best"] = sha_set[d_sha]
 
+    # --- independently computed perceptual hash (gateway only) -----------
+    if f["sidecar"]:
+        media_ref = desc.get("media_uri", "")
+        if not _is_safe_url(media_ref):
+            media_ref = ""
+    else:
+        media_ref = uri
+    observed = _fetch_gateway_phash(gateway, media_ref)
+    f["phash"] = observed
+    f["trusted"] = observed != ""
     if observed != "":
         best = -1
         for b in baselines:
@@ -598,43 +619,38 @@ def _observe(
     return f
 
 
-def _decide(f: dict) -> str:
-    """Deterministic verdict from observed features."""
+def _decide(f: dict) -> tuple:
+    """Deterministic (verdict, reason) from observed features.
+
+    CONFIRMED_DEEPFAKE needs explicit evidence of forgery:
+      * a signature claiming the entity that fails secp256k1 verification, or
+      * a valid signature whose media, hashed independently, diverges > 10 bits, or
+      * independently hashed media within 10 bits of official media, unsigned,
+        hosted off the entity's domain.
+    A page that merely mentions an entity is never a deepfake."""
     if not f["reachable"]:
-        return V_INCONCLUSIVE
+        return V_INCONCLUSIVE, "unreachable"
     if f["exact"]:
-        return V_LEGIT  # authentic bytes, regardless of where they are hosted
+        return V_LEGIT, "exact_authentic_bytes"
+    if f["sig"] == SIG_INVALID and f["claims_victim"]:
+        return V_DEEPFAKE, "forged_signature"
     if f["sig"] == SIG_VALID:
+        if f["bound"]:
+            return V_LEGIT, "signed_bytes_match"
         if f["d_signed"] >= 0:
-            return V_LEGIT if f["d_signed"] <= HAMMING_THRESHOLD else V_DEEPFAKE
-        if f["mismatch"]:
-            return V_DEEPFAKE  # a valid signature that does not cover the served bytes
-        if f["d_base"] >= 0:
-            return V_LEGIT if f["d_base"] <= HAMMING_THRESHOLD else V_DEEPFAKE
-        return V_INCONCLUSIVE
-    if f["sig"] == SIG_MISSING and f["official"]:
-        return V_LEGIT  # served from the entity's own domain
-    if f["claims"]:
-        return V_DEEPFAKE  # claims the identity with a forged / missing signature
-    return V_LEGIT  # no impersonation claim: nothing to punish
-
-
-def _reason_for(f: dict, verdict: str) -> str:
-    if verdict == V_INCONCLUSIVE:
-        return "unreachable" if not f["reachable"] else "insufficient_evidence"
-    if verdict == V_LEGIT:
-        if f["exact"]:
-            return "exact_authentic_bytes"
-        if f["sig"] == SIG_VALID:
-            return "valid_signature_and_phash_match"
-        if f["official"]:
-            return "official_channel_origin"
-        return "no_identity_claim"
-    if f["sig"] == SIG_VALID:
-        return "signature_payload_mismatch" if f["mismatch"] else "phash_divergence"
-    if f["d_base"] > HAMMING_THRESHOLD and f["sig"] != SIG_MISSING:
-        return "forged_signature_and_phash_divergence"
-    return "forged_signature" if f["sig"] == SIG_INVALID else "missing_signature"
+            if f["d_signed"] <= HAMMING_THRESHOLD:
+                return V_LEGIT, "valid_signature_and_phash_match"
+            return V_DEEPFAKE, "phash_divergence"
+        return V_INCONCLUSIVE, "unverifiable_signed_media"
+    if f["official"]:
+        return V_LEGIT, "official_channel_origin"
+    if f["trusted"] and f["d_base"] >= 0:
+        if f["d_base"] <= HAMMING_THRESHOLD:
+            return V_DEEPFAKE, "unsigned_copy_of_official_media"
+        return V_LEGIT, "unrelated_media"
+    if f["media_like"] or f["sidecar"]:
+        return V_INCONCLUSIVE, "unverifiable_media"
+    return V_LEGIT, "no_forgery_evidence"
 
 
 def _close(a: int, b: int) -> bool:
@@ -654,9 +670,10 @@ def _agrees(leader: dict, mine: dict) -> bool:
         if not mine["reachable"]:
             return True
         return (
-            leader["verdict"] == _decide(mine)
+            leader["verdict"] == _decide(mine)[0]
             and leader["sig"] == mine["sig"]
             and bool(leader["exact"]) == mine["exact"]
+            and bool(leader["trusted"]) == mine["trusted"]
             and _close(int(leader["d_base"]), mine["d_base"])
             and _close(int(leader["d_signed"]), mine["d_signed"])
         )
@@ -1301,8 +1318,15 @@ class AegisMedia(gl.contract.Contract):
     @gl.public.write.payable
     def challenge_broadcast(self, victim_entity_id: u256, contested_uri: str, publisher_entity_id: u256) -> dict:
         """Challenge a contested URL that claims to speak for `victim_entity_id`.
-        `publisher_entity_id` is the staked entity that published it (0 when the
-        publisher is unknown or unstaked). msg.value = bond + 3% arbitration fee."""
+        `publisher_entity_id` is the registered entity the challenger accuses of
+        publishing it, or 0 when the publisher is unknown. A non-zero publisher is
+        only valid when the contested URL is hosted on that entity's registered
+        domain. msg.value = bond + 3% arbitration fee.
+
+        Settlement never draws on the fee pool: a bounty is paid only out of a
+        publisher's slashed stake, and the circuit breaker only trips when such a
+        slash happens, so planting forgery evidence on a page cannot flag a victim
+        unless the page's own staked host pays for it."""
         victim_id = int(victim_entity_id)
         publisher_id = int(publisher_entity_id)
         victim = self._entity(victim_id)
@@ -1310,6 +1334,10 @@ class AegisMedia(gl.contract.Contract):
             raise gl.vm.UserError(f"{ERR_STATE} unknown publisher entity")
         if not _is_safe_url(contested_uri):
             raise gl.vm.UserError(f"{ERR_UNSAFE_URL} contested_uri")
+        # Domain binding: an entity can only be held responsible for media hosted on
+        # the domain it registered, so nobody can name an innocent entity as publisher.
+        if publisher_id != 0 and not _host_matches(contested_uri, self.entities[publisher_id].domain):
+            raise gl.vm.UserError(f"{ERR_PUBLISHER} contested URL is not hosted on the publisher's registered domain")
 
         value = int(gl.message.value)
         bond = value * BPS // (BPS + ARBITRATION_FEE_BPS)
@@ -1333,22 +1361,22 @@ class AegisMedia(gl.contract.Contract):
 
         # --- validator consensus ------------------------------------------
         domain_separator = self._domain_separator()
-        name, domain, handle, signer = victim.name, victim.domain, victim.handle, victim.signer
+        domain, signer = victim.domain, victim.signer
         gateway = self.phash_gateway
 
         def leader_fn() -> dict:
             f = _observe(
-                contested_uri, victim_id, name, domain, handle, signer,
+                contested_uri, victim_id, domain, signer,
                 baselines, domain_separator, gateway,
             )
-            f["verdict"] = _decide(f)
+            f["verdict"], f["reason"] = _decide(f)
             return f
 
         def validator_fn(leaders_res: gl.vm.Result) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
                 return False
             mine = _observe(
-                contested_uri, victim_id, name, domain, handle, signer,
+                contested_uri, victim_id, domain, signer,
                 baselines, domain_separator, gateway,
             )
             return _agrees(leaders_res.calldata, mine)
@@ -1368,12 +1396,10 @@ class AegisMedia(gl.contract.Contract):
 
         if verdict == V_DEEPFAKE:
             self._credit(challenger_key, bond)  # bond refunded
+            # The bounty is the challenger's half of the publisher's slashed stake and
+            # nothing else. Without a staked, domain-bound publisher there is no payout.
             if publisher_id != 0 and self.entities[publisher_id].stake > 0:
                 slashed, burned, bounty = self._slash_publisher(publisher_id, challenger_key)
-            else:
-                bounty = min(int(self.protocol_fees) * UNSTAKED_BOUNTY_CAP_BPS // BPS, bond)
-                self.protocol_fees -= bounty
-                self._credit(challenger_key, bounty)
         elif verdict == V_LEGIT:
             self._credit(victim.owner.as_hex, bond)  # forfeited bond awarded to the entity
         else:
@@ -1383,7 +1409,9 @@ class AegisMedia(gl.contract.Contract):
         # Re-read the victim: it may also be the slashed publisher.
         victim = self.entities[victim_id]
         victim.challenges_received += 1
-        if verdict == V_DEEPFAKE:
+        if verdict == V_DEEPFAKE and slashed > 0:
+            # Circuit breaker: only after a real slash, so tripping it always costs
+            # the accused publisher's own stake.
             victim.flag_until = now + FLAG_DURATION
             victim.flag_count += 1
         elif verdict == V_LEGIT:
@@ -1399,7 +1427,7 @@ class AegisMedia(gl.contract.Contract):
             bond=bond,
             fee=fee,
             verdict=verdict,
-            reason=_reason_for(f, verdict),
+            reason=f["reason"],
             sig_state=f["sig"],
             distance=d if d >= 0 else 0,
             has_distance=d >= 0,

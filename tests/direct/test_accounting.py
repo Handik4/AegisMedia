@@ -4,7 +4,7 @@ from conftest import *
 
 
 def serve_forged(w, body=b"Ethereum Foundation announces the Merge airdrop!"):
-    mock_page(w, r"impostor\.example", body=body)
+    mock_page(w, r"impostor\.example", body=body, headers=forged_headers(w))
 
 
 def test_solvency_holds_through_a_full_lifecycle(scenario):

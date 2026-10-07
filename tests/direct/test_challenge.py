@@ -14,7 +14,10 @@ def gateway(w, phash, status=200):
 
 
 def serve_forged(w, headers=None, body=b"Ethereum Foundation announces the Merge airdrop!"):
-    mock_page(w, r"impostor\.example", body=body, headers=headers or {})
+    """Serve a page at the impostor host. Default: a descriptor claiming the victim but
+    signed with the attacker's key. Pass headers={} for a page with no descriptor."""
+    mock_page(w, r"impostor\.example", body=body,
+              headers=forged_headers(w) if headers is None else headers)
 
 
 def verdict_of(result):
@@ -22,30 +25,31 @@ def verdict_of(result):
 
 
 # ------------------------------------------------------------ deepfake paths
-def test_missing_signature_claiming_identity_is_a_confirmed_deepfake(scenario):
+def test_unsigned_copy_of_official_media_is_a_deepfake_when_hashed_independently(scenario):
     w = scenario
-    serve_forged(w)
+    gateway(w, phash_at_distance(PHASH_BASE, 4))  # gateway hashes the raw media: 4 bits from official
+    serve_forged(w, {}, b"recompressed official image, no signature")
     r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
-    assert verdict_of(r) == ("CONFIRMED_DEEPFAKE", "missing_signature")
-    assert r["sig_state"] == "MISSING"
+    assert verdict_of(r) == ("CONFIRMED_DEEPFAKE", "unsigned_copy_of_official_media")
+    assert r["sig_state"] == "MISSING" and r["distance"] == 4
 
 
 def test_forged_signature_is_a_confirmed_deepfake(scenario):
     w = scenario
-    forged = descriptor_headers(w, KEY_ATTACKER, w.victim, AUTH_URI, AUTH_SHA, PHASH_BASE, w.meta, w.ts)
-    serve_forged(w, forged, b"fake-bytes")
+    serve_forged(w, forged_headers(w), b"fake-bytes")
     r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
     assert verdict_of(r) == ("CONFIRMED_DEEPFAKE", "forged_signature")
     assert r["sig_state"] == "INVALID"
 
 
-def test_copied_valid_signature_over_altered_bytes_is_a_deepfake(scenario):
-    """Attacker re-serves the authentic descriptor and signature with different media."""
+def test_copied_valid_signature_over_altered_bytes_is_inconclusive_without_a_gateway(scenario):
+    """The signature is real but nothing independent measured the served media, so the
+    contract refuses to slash on the origin's say-so."""
     w = scenario
     serve_forged(w, w.auth_headers, b"deepfake-video-bytes")
     r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
-    assert verdict_of(r) == ("CONFIRMED_DEEPFAKE", "signature_payload_mismatch")
-    assert r["sig_state"] == "VALID"
+    assert verdict_of(r) == ("INCONCLUSIVE_DISMISSED", "unverifiable_signed_media")
+    assert r["sig_state"] == "VALID" and r["slashed"] == 0 and not w.c.is_impersonation_active(w.victim)
 
 
 def test_altered_phash_beyond_threshold_is_a_deepfake(scenario):
@@ -60,27 +64,28 @@ def test_altered_phash_beyond_threshold_is_a_deepfake(scenario):
 def test_forged_signature_and_diverged_phash_reports_both(scenario):
     w = scenario
     gateway(w, phash_at_distance(PHASH_BASE, 30))
-    forged = descriptor_headers(w, KEY_ATTACKER, w.victim, AUTH_URI, AUTH_SHA, PHASH_BASE, w.meta, w.ts)
-    serve_forged(w, forged, b"other")
+    serve_forged(w, forged_headers(w), b"other")
     r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
-    assert verdict_of(r) == ("CONFIRMED_DEEPFAKE", "forged_signature_and_phash_divergence")
+    assert verdict_of(r) == ("CONFIRMED_DEEPFAKE", "forged_signature")
     assert r["distance"] == 30
 
 
 def test_json_sidecar_descriptor_with_forged_signature_is_a_deepfake(scenario):
     w = scenario
     import json
-    forged = descriptor_headers(w, KEY_ATTACKER, w.victim, AUTH_URI, AUTH_SHA, PHASH_BASE, w.meta, w.ts)
+    forged = forged_headers(w)
     body = json.dumps({"aegis": {k[len("x-aegis-"):].replace("-", "_"): v for k, v in forged.items()}}).encode()
     serve_forged(w, {}, body)
     r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
     assert r["verdict"] == "CONFIRMED_DEEPFAKE" and r["sig_state"] == "INVALID"
 
 
-def test_identity_claim_by_domain_mention_alone_is_enough(scenario):
+def test_text_claiming_to_be_the_entity_is_not_forgery_evidence(scenario):
     w = scenario
-    serve_forged(w, body=b"official notice from ethereum.org: send ETH to claim")
-    assert challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)["verdict"] == "CONFIRMED_DEEPFAKE"
+    serve_forged(w, {}, b"official notice from ethereum.org: send ETH to claim")
+    r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
+    assert verdict_of(r) == ("LEGITIMATE_MEDIA", "no_forgery_evidence")
+    assert w.c.get_entity(w.publisher)["stake"] == 20 * ATTO
 
 
 # ------------------------------------------------------------ legitimate paths
@@ -101,8 +106,8 @@ def test_hamming_threshold_boundary_is_ten_bits_inclusive(scenario):
     assert challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)["verdict"] == "LEGITIMATE_MEDIA"
     other = "https://impostor.example/second.png"
     w.vm.clear_mocks()  # the harness matches the first registered mock, so replace both
+    gateway(w, phash_at_distance(PHASH_BASE, 11))  # gateway first: its URL embeds the contested URL
     serve_forged(w, w.auth_headers, b"mirror")
-    gateway(w, phash_at_distance(PHASH_BASE, 11))
     assert challenge(w, w.charlie, w.victim, other, w.publisher)["verdict"] == "CONFIRMED_DEEPFAKE"
 
 
@@ -123,9 +128,9 @@ def test_unsigned_page_on_the_entitys_own_domain_is_legitimate(scenario):
 
 def test_page_that_makes_no_identity_claim_is_legitimate(scenario):
     w = scenario
-    serve_forged(w, body=b"a video about cats")
+    serve_forged(w, {}, b"a video about cats")
     r = challenge(w, w.charlie, w.victim, CONTESTED, w.publisher)
-    assert verdict_of(r) == ("LEGITIMATE_MEDIA", "no_identity_claim")
+    assert verdict_of(r) == ("LEGITIMATE_MEDIA", "no_forgery_evidence")
 
 
 # ------------------------------------------------------------ inconclusive
@@ -226,25 +231,11 @@ def test_inconclusive_refunds_the_bond_but_keeps_the_fee(scenario):
     assert w.c.is_impersonation_active(w.victim) is False
 
 
-def test_unstaked_publisher_bounty_comes_from_the_fee_pool(scenario):
-    w = scenario
-    # build a fee pool first with one inconclusive challenge of 10 GEN
-    mock_page(w, r"outage\.example", status=503)
-    challenge(w, w.charlie, w.victim, "https://outage.example/a", 0, 10 * ATTO)
-    pool = w.c.get_solvency()["protocol_fees"]
-    serve_forged(w)
-    r = challenge(w, w.charlie, w.victim, CONTESTED, 0, ATTO // 2)
-    fee = (ATTO // 2) * FEE_BPS // 10000
-    expected = min((pool + fee) * 5000 // 10000, ATTO // 2)
-    assert r["verdict"] == "CONFIRMED_DEEPFAKE" and r["slashed"] == 0 and r["bounty"] == expected
-    solvent(w)
-
-
 def test_publisher_slash_of_the_victim_itself_is_consistent(scenario):
     w = scenario
-    serve_forged(w)
-    r = challenge(w, w.charlie, w.victim, CONTESTED, w.victim)  # compromised-key case
-    assert r["slashed"] == 5 * ATTO * 5000 // 10000
+    mock_page(w, r"ethereum\.org/forged", body=b"forged", headers=forged_headers(w))
+    r = challenge(w, w.charlie, w.victim, "https://ethereum.org/forged.png", w.victim)  # compromised-key case
+    assert r["verdict"] == "CONFIRMED_DEEPFAKE" and r["slashed"] == 5 * ATTO * 5000 // 10000
     e = w.c.get_entity(w.victim)
     assert e["stake"] == 5 * ATTO - r["slashed"] and e["flagged"] and e["times_slashed"] == 1
     solvent(w)
@@ -252,8 +243,8 @@ def test_publisher_slash_of_the_victim_itself_is_consistent(scenario):
 
 def test_slash_below_minimum_stake_revokes_broadcast_authority(scenario):
     w = scenario
-    serve_forged(w)
-    challenge(w, w.charlie, w.victim, CONTESTED, w.victim)
+    mock_page(w, r"ethereum\.org/forged", body=b"forged", headers=forged_headers(w))
+    challenge(w, w.charlie, w.victim, "https://ethereum.org/forged.png", w.victim)
     assert w.c.get_entity(w.victim)["status"] == "UNDERCOLLATERALIZED"
     with w.vm.expect_revert("ERR_INSUFFICIENT_STAKE"):
         attest(w, w.alice, w.victim, KEY_FOUNDATION, AUTH_URI + "2", sha_of("new"), PHASH_BASE)

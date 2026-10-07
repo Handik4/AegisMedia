@@ -7,7 +7,7 @@ Official entities (founders, foundations, DAOs) stake GEN to register a canonica
 | Piece | Where |
 |---|---|
 | Intelligent contract | `contracts/aegis_media.py` |
-| Direct-mode test suite (170+ tests) | `tests/direct/` |
+| Direct-mode test suite | `tests/direct/` (includes the audit PoCs in `test_aegis_media.py`) |
 | Dashboard (Next.js 14 + Tailwind, live mode only) | `frontend/` |
 | Deploy / live verification | `scripts/deploy.py`, `scripts/verify_live.py` |
 
@@ -19,13 +19,13 @@ uv venv --python 3.12 && uv pip install --prerelease=allow -r requirements.txt
 .venv/bin/genvm-lint check contracts/aegis_media.py     # 0 errors
 .venv/bin/python -m pytest                              # direct-mode suite (~4 min)
 
-.venv/bin/python scripts/deploy.py                      # deploy + seed + sync frontend
-.venv/bin/python scripts/verify_live.py                 # live end-to-end checks
+.venv/bin/python -m scripts.deploy                      # deploy + seed + sync frontend
+.venv/bin/python -m scripts.verify_live                 # live end-to-end checks
 
 cd frontend && npm install && npm run dev               # http://localhost:3000
 ```
 
-`deploy.py` generates throwaway keys into `.env` (gitignored) and funds them from the Studio faucet. It writes the contract address to `frontend/lib/deployment.json`, so the dashboard needs no further configuration. The dashboard has no mock layer: until a contract is deployed it says so instead of showing fake data.
+`deploy.py` generates throwaway keys into `.env` (gitignored) and funds them from the Studio faucet. It records the deployment in `deployments/studio-next.json` and syncs the address to `frontend/lib/deployment.json`, so the dashboard needs no further configuration. The dashboard has no mock layer: until a contract is deployed it says so instead of showing fake data.
 
 ## How it works
 
@@ -46,14 +46,15 @@ sequenceDiagram
     H->>C: challenge_broadcast(victim, url, publisher) + bond + 3% fee
     Note over C: Deepfake Challenge: window, replay and SSRF checks pass
     C->>V: run_nondet(leader_fn, validator_fn)
-    V->>X: GET url (headers, body, descriptor, optional pHash gateway)
-    X-->>V: media + x-aegis-* descriptor
-    V->>V: sha256 of bytes, Hamming(pHash, baselines), recover signer
+    V->>X: GET url (headers, body, x-aegis-* descriptor)
+    X-->>V: media + descriptor
+    V->>V: sha256 of the served bytes, recover signer (secp256k1)
+    V->>V: pHash of the raw media from the pHash gateway (only trusted source)
     Note over V: GenVM Multi-Validator pHash Consensus: agree if verdict, signature state and distance (+-2 bits) match
     V-->>C: verdict + evidence features
     alt CONFIRMED_DEEPFAKE
-        C->>C: slash publisher 50%: half burned, half bounty. Bond refunded
-        C->>C: victim.flag_until = now + 7 days
+        C->>C: publisher domain must host the URL. Slash 50%: half burned, half bounty. Bond refunded
+        C->>C: only after a real slash: victim.flag_until = now + 7 days
     else LEGITIMATE_MEDIA
         C->>C: bond forfeited to the entity
     else INCONCLUSIVE_DISMISSED
@@ -74,16 +75,19 @@ Official Staking ──► Media Ingestion ──► Deepfake Challenge ──�
 
 ### Roles in a challenge
 
-- **Victim entity**: the identity the contested media claims to speak for. On a confirmed deepfake it is flagged `FLAGGED_IMPERSONATION` for 7 days. Downstream contracts read `is_impersonation_active(victim)`.
-- **Publisher entity** (optional): the *staked* channel that posted the forgery. Its stake is slashed by `SLASH_BPS` (50% of its stake), split 50% burned and 50% bounty. If the impostor is unstaked or unknown (`publisher = 0`) there is nothing to slash; the bounty is instead paid from the arbitration-fee pool, capped at half the pool and at the bond.
+- **Victim entity**: the identity the contested media claims to speak for. On a confirmed deepfake that slashed a staked publisher, it is flagged `FLAGGED_IMPERSONATION` for 7 days. Downstream contracts read `is_impersonation_active(victim)`.
+- **Publisher entity** (optional, `0` when unknown): the registered entity the challenger accuses of hosting the forgery. **Domain binding is enforced**: the contested URL's host must equal the publisher's registered domain or be a subdomain of it, otherwise the call reverts with `ERR_PUBLISHER_MISMATCH` before any bond is taken. You cannot slash an entity for a URL it does not host. Its stake is slashed by `SLASH_BPS` (50%), split 50% burned and 50% bounty.
+- **No publisher**: with `publisher = 0` a verdict is recorded and the bond refunded, but **there is no bounty and no flag**. A bounty is paid only out of a slashed stake; the fee pool never subsidises payouts.
 
 ### Verdicts
 
+`CONFIRMED_DEEPFAKE` requires *explicit evidence of forgery*. A page that merely mentions an entity (a news article, a blog post, a tweet embed) is never a deepfake.
+
 | Verdict | Condition | Economics |
 |---|---|---|
-| `CONFIRMED_DEEPFAKE` | Hamming distance > 10 bits against the signed or attested baseline, **or** the media claims the entity's identity with a forged or missing signature, **or** a valid signature is replayed over different bytes | Bond refunded, bounty paid, publisher slashed, victim flagged for 7 days |
-| `LEGITIMATE_MEDIA` | Exact authentic bytes, valid signature with matching pHash (≤ 10 bits), served from the entity's own domain, or no identity claim at all | Bond forfeited to the entity, fee kept |
-| `INCONCLUSIVE_DISMISSED` | URL unreachable, rate-limited (429), 4xx or 5xx | Bond refunded, 3% fee kept |
+| `CONFIRMED_DEEPFAKE` | (a) a signature that claims the entity but fails secp256k1 verification against its registered key, **or** (b) a valid signature over media whose **independently computed** pHash diverges more than 10 bits from the signed pHash, **or** (c) unsigned media, hosted off the entity's domain, whose independently computed pHash is within 10 bits of official media | Bond refunded. If a staked, domain-bound publisher exists: it is slashed, the challenger gets half of the slash and the victim is flagged for 7 days |
+| `LEGITIMATE_MEDIA` | Exact authentic bytes; a valid signature over the exact bytes served; a valid signature whose independently hashed media matches within 10 bits; the entity's own domain; independently hashed media unrelated to the baselines; or text with no forgery evidence | Bond forfeited to the entity, fee kept |
+| `INCONCLUSIVE_DISMISSED` | URL unreachable, rate-limited, 4xx or 5xx; or **unmeasurable media** (a valid signature or media-like payload with no gateway, a JSON sidecar without a gateway) | Bond refunded, 3% fee kept |
 
 ### Economics and solvency
 
@@ -113,9 +117,25 @@ The GenVM runner ships neither `ecrecover` nor `keccak256`, so `contracts/aegis_
 
 The validators read the contested URL for these fields, from `x-aegis-*` response headers or from a JSON body (top level or an `aegis` object):
 
-`entity_id`, `content_uri`, `sha256`, `phash`, `metadata_digest`, `timestamp`, `signature`
+`entity_id`, `content_uri`, `sha256`, `phash`, `metadata_digest`, `timestamp`, `signature`, `media_uri`
 
-The SHA-256 of the served bytes is always computed by the validators themselves. If the governor configures a **pHash gateway** (`set_phash_gateway`), each validator also asks `GET {gateway}?url=<contested>` for `{"phash": "<16 hex>"}`, which is the only source that can score re-encoded media.
+What is trusted, and what is not:
+
+| Source | Trusted as | Never trusted as |
+|---|---|---|
+| SHA-256 of the served bytes (computed by every validator) | exact-match evidence against attested digests | |
+| secp256k1 recovery of the `signature` over the descriptor | proof the entity key signed that descriptor | proof that the *served media* is what was signed |
+| `phash` in a header or JSON sidecar | the value the signature covers | a **measurement of the media**. It is origin-asserted |
+| pHash returned by the configured gateway | the only independently computed perceptual hash | |
+
+### JSON sidecar and gateway limitation
+
+A JSON sidecar describes media, it is not the media. The GenVM runner cannot decode images or video, so a validator cannot hash a sidecar's referenced media itself. Therefore:
+
+- **With a gateway** (`set_phash_gateway`): validators ask `GET {gateway}?url=<media_uri>` (the sidecar's `media_uri`, SSRF-checked) and compare the gateway's pHash to the signed one.
+- **Without a gateway, or without a safe `media_uri`**: a sidecar can only produce `INCONCLUSIVE_DISMISSED` (or `CONFIRMED_DEEPFAKE` when its signature is forged, since that needs no media measurement). It is never `LEGITIMATE_MEDIA`, because wrapping fake media in a sidecar with a genuine signature and an authentic-looking pHash would otherwise buy an unearned legitimacy verdict.
+
+This means that **no gateway is configured by default and perceptual-hash-based verdicts (b) and (c) are unavailable until the governor sets one.** Until then the contract enforces only exact-byte matches and signature checks.
 
 ## Game Theory, Perceptual Hashing Limits & Threat Model
 
@@ -130,7 +150,7 @@ The SHA-256 of the served bytes is always computed by the validators themselves.
 - A 64-bit pHash has a **collision/blind-spot trade-off**. Two unrelated images agree on about 32 bits, so a random collision inside 10 bits has probability about 2⁻²⁸ (the binomial tail of 64 bits at p = ½). Targeted attacks are far cheaper: an adversary can run gradient or hill-climb attacks to craft an image that is visually unrelated but within 10 bits of a baseline (a **second-preimage on a lossy hash**), and a deepfake that preserves global luminance structure (same scene, swapped face) can stay within threshold. **Hamming distance ≤ 10 means "perceptually similar", not "authentic".** Authenticity comes from the signature; pHash only handles re-encoding drift.
 - The 10-bit threshold sits between benign drift (recompression, resize, mild crop usually move 0 to 6 bits) and edits (usually > 14). Between 7 and 14 bits is a grey zone where honest and malicious edits overlap. Lowering the threshold raises false-positive slashes of honest mirrors; raising it widens the adversary's forgery budget.
 - pHash does not cover audio, heavy crops, rotations or mirrored frames. Video is hashed on a single frame by the dashboard, so frame-level edits elsewhere are invisible.
-- **In-VM decoding is unavailable**, so a pHash must come from the descriptor or the gateway. Without a gateway, served bytes whose SHA-256 differs from the signed SHA-256 cannot be scored and are treated as an invalid signature binding, which means a lossless re-host passes and a re-encoded honest mirror needs the gateway to avoid a false deepfake verdict.
+- **In-VM decoding is unavailable**, so the only trusted pHash is the gateway's. Without a gateway, media that is not byte-identical to an attested file or to the bytes a valid signature covers is `INCONCLUSIVE_DISMISSED`, never a slash and never a legitimacy verdict. An unsigned recompression of official media (verdict (c)) is a deepfake only when the gateway measures it, and honest unsigned re-posts of official images are exposed to that rule by design.
 
 ### Oracle latency and consensus risks
 
@@ -138,6 +158,17 @@ The SHA-256 of the served bytes is always computed by the validators themselves.
 - An attacker who controls the contested origin can serve different content per client (**cloaking**) to split validators or hide the forgery from them. The result is an inconclusive or failed round (the challenge reverts), not a wrongful slash. Retries after the 1-hour inconclusive cooldown are allowed.
 - A forger can **take the page down** before validators fetch it, turning a true positive into `INCONCLUSIVE_DISMISSED`. Challengers should snapshot first and challenge fast; the fee is the price of that race.
 - Consensus on Studio Next takes minutes, so a viral forgery is live during the round. The circuit breaker engages only after the verdict.
+
+### Audit hardening
+
+| Finding | Attack | Fix |
+|---|---|---|
+| Arbitrary publisher slashing | Name an innocent entity as `publisher` for any URL | The URL must be hosted on the publisher's registered domain (exact or subdomain), else revert |
+| News-article circuit-breaker DDoS | File real news articles that mention the entity; 0.015 GEN flags it for 7 days | A text mention is never evidence. Deepfake needs a forged signature or independently hashed media. The breaker trips only after a **real slash** of a staked, domain-bound publisher, so planting forgery evidence on a page you control (a junk signature) costs you your own stake |
+| JSON sidecar bypass | Wrap fake media in a sidecar with a valid signature and an authentic pHash | Origin-asserted pHashes are never trusted; no gateway means `INCONCLUSIVE_DISMISSED` |
+| Fee pool drain | `publisher = 0` paid a bounty out of accumulated fees | Bounties come only from slashed stake; the fee pool only ever grows |
+
+Residual cost to flag a victim: an attacker must register a staked entity (5 GEN minimum), host a forgery on its domain and lose half its stake, 25% of which is burned for good, to hold the breaker for 7 days. That is a deliberate price, not zero.
 
 ### Other threats
 
@@ -156,7 +187,8 @@ The SHA-256 of the served bytes is always computed by the validators themselves.
 
 ### Known limitations
 
-- The identity-claim heuristic (name, domain or handle mentioned in the page text, or a signature present) is deliberately simple. Pages that impersonate without naming the entity are classified `LEGITIMATE_MEDIA`, which fails safe for the challenger's bond but not for users.
+- Pages that impersonate an entity in plain text (a fake announcement as HTML or a tweet) carry no cryptographic or perceptual evidence and are classified `LEGITIMATE_MEDIA`. The protocol authenticates media and signatures, not prose. This fails safe against griefing and unsafe for users reading forged text.
+- An unstaked impersonator (`publisher = 0`) can be recorded as a deepfake but cannot be slashed or trip the breaker. The breaker needs a staked, domain-bound publisher by design.
 - The slash is a fixed 50% of stake, with no per-incident severity scaling.
 - The burn is an asynchronous `emit_transfer` to `0x…dEaD`. If enqueueing fails, the value is retained as a protocol liability rather than lost.
 

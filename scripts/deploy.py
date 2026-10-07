@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deploy AegisMedia to GenLayer Studio Next, seed two demo entities and sync the frontend.
 
-    .venv/bin/python scripts/deploy.py
+    .venv/bin/python -m scripts.deploy
 
 Keys: a throwaway deployer key and two seed signing keys are generated into `.env`
 on first run (gitignored) and funded from the Studio faucet. Override with
@@ -12,7 +12,10 @@ import sys
 
 from eth_account import Account
 
-from aegis_chain import ATTO, CONTRACT_FILE, Chain, get_or_create_key, save_deployment
+try:  # `python -m scripts.deploy` (package) or `python scripts/deploy.py` (script)
+    from .aegis_chain import ATTO, CONTRACT_FILE, Chain, get_or_create_key, save_deployment
+except ImportError:
+    from aegis_chain import ATTO, CONTRACT_FILE, Chain, get_or_create_key, save_deployment
 
 SEED_STAKE = 5 * ATTO
 SEEDS = [
@@ -42,7 +45,7 @@ def main() -> int:
 
     overview = deployer.read("get_protocol_overview")
     print(f"protocol overview: {overview}")
-    print("frontend/lib/deployment.json updated; the dashboard now reads this contract live.")
+    print("deployments/studio-next.json and frontend/lib/deployment.json updated; the dashboard now reads this contract live.")
     return 0
 
 
