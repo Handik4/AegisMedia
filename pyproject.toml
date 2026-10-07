@@ -1,0 +1,7 @@
+# Pytest configuration for the AegisMedia suites.
+#
+#   tests/direct/   in-memory GenVM execution, no network (~30ms per test)
+#
+#   .venv/bin/python -m pytest -q
+[tool.pytest.ini_options]
+testpaths = ["tests/direct"]

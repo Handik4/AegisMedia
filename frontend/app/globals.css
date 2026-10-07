@@ -1,0 +1,100 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Light theme tokens. Names are kept from the first design pass so every component
+   picks up the palette: ink = canvas, ink-2 = surface, seal = verified, alarm = flagged. */
+:root {
+  --ink: #f8fafc;        /* slate-50 canvas and inset wells */
+  --ink-2: #ffffff;      /* card surface */
+  --ink-3: #f1f5f9;      /* slate-100 hover / toast */
+  --line: #e2e8f0;       /* slate-200 borders */
+  --paper: #0f172a;      /* slate-900 headings */
+  --body: #475569;       /* slate-600 body copy */
+  --muted: #64748b;      /* slate-500 helper text */
+  --seal: #047857;       /* emerald-700 */
+  --seal-dim: #ecfdf5;   /* emerald-50 */
+  --alarm: #be123c;      /* rose-700 */
+  --alarm-dim: #fff1f2;  /* rose-50 */
+  --amber: #b45309;      /* amber-700 */
+  --amber-dim: #fffbeb;  /* amber-50 */
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background: #f8fafc;
+  color: var(--body);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4 {
+  color: var(--paper);
+}
+
+/* A faint ledger grid behind the page header area. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image:
+    linear-gradient(to right, rgba(15, 23, 42, 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(15, 23, 42, 0.035) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse at 50% 0%, #000 0%, transparent 70%);
+}
+
+::selection {
+  background: #c7d2fe;
+  color: var(--paper);
+}
+
+@layer components {
+  .panel {
+    @apply rounded-xl border border-slate-200 bg-white shadow-sm;
+  }
+  .label {
+    @apply font-mono text-[11px] uppercase tracking-[0.14em] text-slate-500;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition
+      focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500
+      disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-indigo-600 text-white shadow-sm hover:bg-indigo-700;
+  }
+  .btn-ghost {
+    @apply btn border border-slate-300 bg-white text-slate-700 shadow-sm hover:bg-slate-50 hover:border-slate-400;
+  }
+  .btn-danger {
+    @apply btn bg-rose-600 text-white shadow-sm hover:bg-rose-700;
+  }
+  .field {
+    @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900
+      focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100;
+  }
+}
+
+input::placeholder { color: #94a3b8; }
+
+@keyframes sealIn {
+  0% { transform: scale(0.6) rotate(-14deg); opacity: 0; }
+  60% { transform: scale(1.06) rotate(2deg); opacity: 1; }
+  100% { transform: scale(1) rotate(0); opacity: 1; }
+}
+.seal-in { animation: sealIn 0.55s cubic-bezier(.2,.9,.3,1.2) both; }
+
+@keyframes pulseAlarm {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(225, 29, 72, 0.35); }
+  50% { box-shadow: 0 0 0 8px rgba(225, 29, 72, 0); }
+}
+.pulse-alarm { animation: pulseAlarm 1.8s ease-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .seal-in, .pulse-alarm { animation: none; }
+}
